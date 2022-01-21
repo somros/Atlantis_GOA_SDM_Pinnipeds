@@ -1,0 +1,317 @@
+---
+title: "Harbor seals"
+author: "Alberto Rovellini"
+date: "1/20/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Purpose
+
+This document constructs spatial distributions for pinnipeds (harbor seals and northern fur seals) in Atlantis GOA.
+
+Harbor seals for the Alaska portion of the model are captured by 2018 harbor seal abundance estimates. Data was shared by Josh London as ARCGIS layer. Details on the data below.
+
+**Service Description**: This dataset contains 2018 abundance estimates of coastal harbor seals in Alaska by survey unit. Abundance estimates are calculated from aerials survey counts and haul-out behavior derived from telemetry deployments.
+
+**Description**: Aerial surveys of coastal Alaska are the primary method for estimating abundance of harbor seals. Alaska harbor seal abundance estimates are based on aerial survey data collected during 1996-2018. The majority of survey data occurs during the month of August when seals are molting. Additionally, estimates of seals in the water, and not present during the aerial count, are derived from telemetry deployments on harbor seals. Current abundance estimates are calculated at the stock and survey unit (i.e., polygon) level. Abundance estimates are not calculated by site because there is too much variability between specific haul-out sites. Significant differences in seasonal abundance are possible and caution should be applied when using these estimates for periods outside the survey period. This dataset does not include estimates of abundance for Iliamna Lake, currently part of the Bristol Bay stock, or the Pribilof Islands stock. Data are provided by the NOAA Alaska Fisheries Science Center.
+
+The goal is to map abundances from the cells of this shapefile to our Atlantis boxes.
+
+For British Columbia, we use older DFO-CRIMS legacy data - which seems to be the only easily accessible spatially annotated dataset on harbor seals haulout locations in BC.
+
+Northern fur seals are highly mobile and do not haul in the GOA. They forage on the GOA slope and shelf, but there isn't much data on their spatial distributions. We will approximate them by calculating a proportion between harbor seals and fur seals numbers, allocating fur seals to slope boxes with constant density across the model domain.
+
+```{r}
+library(sf)
+library(tidyverse)
+library(viridis)
+library(maps)
+library(mapdata)
+library(rbgm)
+```
+
+```{r}
+select <- dplyr::select
+```
+
+
+# Harbor seals
+
+## Alaska
+
+### Read data
+
+Read in the seal abundance data.
+```{r}
+harbor2018 <- st_read('data/shapefiles/harbor_seals/harbor_seals_abundance.shp')
+```
+
+Read in the Atlantis files.
+```{r}
+atlantis_bgm <- read_bgm('data/GOA_WGS84_V4_final.bgm')
+atlantis_box <- atlantis_bgm %>% box_sf()
+atlantis_bbox <- atlantis_box %>% st_bbox()
+atlantis_crs <- atlantis_bgm$extra$projection
+
+# coast
+coast <- maps::map(database = 'worldHires', regions = c('USA','Canada'), plot = FALSE, fill=TRUE)
+```
+
+Have a look at this.
+```{r}
+harbor2018 %>%
+  st_transform(crs = atlantis_crs) %>%
+  ggplot()+
+  geom_sf()+
+  geom_sf(data=atlantis_box)+
+  theme_bw()
+```
+
+We cannot subset to the colonies/stocks that overlap with the geometry, because the coarse nature of it means that a lot of stocks in embayments along the coast get cut out. This hampers the overlap approach to assign seal abundance to the Atlantis boxes. Besides, this data is already organized in polygons that have a certain area, so drawing a buffer around them is probably not a good idea.
+
+Probably need to clean this up in QGIS and then find another way to allocate colonies (e.g. to nearest item instead of by overlap, which is fine for our purposes). Save the Atlantis geometry as a shapefile to process in QGIS with the original harbor seal raster. Set the CRS as appropriate. Also save the coastlines.
+```{r}
+atlantis_box %>% 
+  mutate(area = round(area/1000000)) %>%
+  st_transform(crs = crs(harbor2018)) %>% 
+  st_write('data/shapefiles/bgm/bgm.shp')
+
+coast %>% 
+  st_as_sf(crs = 4326) %>% 
+  st_transform(crs = crs(harbor2018)) %>% 
+  st_combine() %>% 
+  st_crop(atlantis_box %>% st_transform(crs = crs(harbor2018)) %>% st_bbox()) %>% 
+  st_write('data/shapefiles/coastline/coast.shp')
+```
+
+Read in the processed shapefile. 
+```{r}
+harbor_2018_goa <- st_read('data/shapefiles/harbor_seals_clipped/harbor_seals_clipped.shp')
+```
+
+### Map data
+
+Now just assign the colonies to the boxes by proximity with a st_nearest() call. We cannot use the buffer because the colonies are nestled along the jagged coastline and their home range is small (10-15 km from the coast, Josh London pers. comm.). This will be an approximation but probably not the worst we are making anyway.
+
+We need to ditch the island boxes. 
+```{r}
+harbor_2018_goa <- harbor_2018_goa %>% st_transform(crs = atlantis_crs) # work in the same CRS as the geometry
+
+atlantis_box_no_islands <- atlantis_box %>% filter(botz<0)
+
+harbor_2018_goa_boxid <- harbor_2018_goa %>%
+  rowwise() %>%
+  mutate(nearest_box_idx = st_nearest_feature(geometry, atlantis_box_no_islands$geometry),
+         nearest_box = atlantis_box_no_islands[nearest_box_idx,]$box_id) %>%
+  ungroup()
+```
+
+View this, does it track with the box numbers?
+```{r}
+harbor_2018_goa_boxid %>% 
+  ggplot()+
+  geom_sf(aes(fill=nearest_box, color=nearest_box))+
+  scale_fill_viridis()+
+  scale_color_viridis()+
+  theme_bw()
+```
+
+Now add up the abundances based on the box index.
+```{r}
+harbor_alaska <- harbor_2018_goa_boxid %>%
+  st_set_geometry(NULL) %>%
+  group_by(nearest_box) %>%
+  summarise(abundance = sum(abund_est, na.rm=T)) %>%
+  ungroup() %>%
+  set_names(c('.bx0','Harbor_AK'))
+
+harbor_goa_box <- atlantis_box %>%
+  left_join(harbor_alaska, by = '.bx0')
+```
+
+Have a look.
+```{r}
+harbor_goa_box %>%
+  ggplot()+
+  geom_sf(aes(fill=Harbor_AK))+
+  scale_fill_viridis()+
+  geom_sf(data = coast_sf)+
+  coord_sf(xlim=c(atlantis_bbox$xmin,atlantis_bbox$xmax), ylim=c(atlantis_bbox$ymin,atlantis_bbox$ymax))+
+  theme_bw()+
+  labs(title = 'Harbor seal abundance by Atlantis box', fill = 'Numbers')
+```
+
+Now we need to fill the BC boxes.
+
+## British Columbia
+
+Exploring harbor seal haulout location and count [CRIMS data](https://open.canada.ca/data/en/dataset/55a0f2d6-b035-4783-ad5d-1a213fd01ed3) from DFO. See metadata details [here](https://catalogue.data.gov.bc.ca/dataset/harbour-seal-haulouts-coastal-resource-information-management-system-crims-/resource/373f1761-093c-4cc2-adce-2e8b4e6c8326). Data downloaded on 01/22/2022.
+
+Note that this is older, legacy data, compared to the recent 2018 source we are using for harbor seals in AK, so once again we may have issues with stiching things across the border.
+
+From the metadata, the projection is: EPSG_3005 - NAD83 BC Albers.
+```{r}
+harbor_dfo <- read.csv('data/DFO_harbor_seals/CRIMS_HARBOUR_SEAL_HAULOUTS/CRMSHRBRS1.csv', fileEncoding = 'UTF-8-BOM')
+
+harbor_dfo <- harbor_dfo %>%
+  st_as_sf(coords = c('X','Y'), crs = 3005) %>% 
+  st_transform(crs = atlantis_crs)
+
+dfo_bbox <- harbor_dfo %>% st_bbox()
+```
+
+Have a look.
+```{r}
+coast_sf <- coast %>% 
+  st_as_sf(crs = 4326) %>% 
+  st_transform(crs = atlantis_crs) %>% 
+  st_combine()
+
+harbor_dfo %>%
+  ggplot()+
+  geom_sf()+
+  geom_sf(data = atlantis_box, alpha = 0)+
+  geom_sf(data = coast_sf)+
+  coord_sf(xlim=c(dfo_bbox$xmin,dfo_bbox$xmax), ylim=c(dfo_bbox$ymin,dfo_bbox$ymax))+
+  theme_bw()
+  
+```
+
+This dataset  captures a lot of haulouts in the Salish Sea but very few up the BC coast. It seems to be all we have.
+
+These are point data, however the buffer approach is problematic due to the fact that most haulouts are deep in the fjords and far from our boxes. Still use the nearest box approach.
+
+First, ditch all those haulouts in the Strait of Georgia.
+```{r}
+harbor_dfo <- harbor_dfo %>% st_crop(atlantis_bbox)
+
+harbor_dfo_boxid <- harbor_dfo %>% 
+  rowwise() %>%
+  mutate(nearest_box_idx = st_nearest_feature(geometry, atlantis_box_no_islands$geometry),
+         nearest_box = atlantis_box_no_islands[nearest_box_idx,]$box_id) %>%
+  ungroup()
+```
+
+View this, does it track with the box numbers?
+```{r}
+harbor_dfo_boxid %>% 
+  ggplot()+
+  geom_sf(aes(fill=nearest_box, color=nearest_box))+
+  scale_fill_viridis()+
+  scale_color_viridis()+
+  theme_bw()
+```
+
+Now add up the abundances based on the box index.
+```{r}
+harbor_canada <- harbor_dfo_boxid %>%
+  st_set_geometry(NULL) %>%
+  group_by(nearest_box) %>%
+  summarise(abundance = sum(MXNMSLS, na.rm=T)) %>%
+  ungroup() %>%
+  set_names(c('.bx0','Harbor_BC'))
+
+harbor_goa_box <- harbor_goa_box %>%
+  left_join(harbor_canada, by = '.bx0')
+```
+
+Now sum harbor seal abundance between AK and BC.
+```{r}
+harbor_goa_box <- harbor_goa_box %>%
+  rowwise() %>%
+  mutate(Harbor_AK = ifelse(is.na(Harbor_AK) | Harbor_AK<0,0,Harbor_AK),
+         Harbor_BC = ifelse(is.na(Harbor_BC) | Harbor_BC<0,0,Harbor_BC)) %>%
+  ungroup() %>%
+  mutate(Harbor_total = Harbor_AK+Harbor_BC)
+```
+
+Have a look.
+```{r}
+harbor_goa_box %>%
+  ggplot()+
+  geom_sf(aes(fill=Harbor_total))+
+  scale_fill_viridis()+
+  geom_sf(data = coast_sf)+
+  coord_sf(xlim=c(atlantis_bbox$xmin,atlantis_bbox$xmax), ylim=c(atlantis_bbox$ymin,atlantis_bbox$ymax))+
+  theme_bw()+
+  labs(title = 'Harbor seal abundance by Atlantis box', fill = 'Numbers')
+```
+
+# Norther fur seals
+
+Northern fur seals do not haul out in the GOA, which is at the edge of their migrations route from the Bering Sea to the US West Coast. NFS have rookeries in the Bering Sea, where they spend time in the summer. In the winter, they move South. Mostly adult males and subadults are in the GOA, where they forage on the slope and shelf. Some references [here](https://link.springer.com/article/10.1007/s00227-010-1589-z?utm_source=getftr&utm_medium=getftr&utm_campaign=getftr_pilot), [here](https://www.nature.com/articles/s41598-019-50230-z), and [here](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0101268). Also, [this report](https://espis.boem.gov/final%20reports/408.pdf) shows sightings of NFS on the GOA upper slope and canyons (i.e. deeper shelf).
+
+There are a few tagging studies, but no spatially-annotated dataset. My strategy here is to qualitatively allocate NFS biomass estimates to the slope (500-200m) boxes. Here is the process:
+
+1. Get number estimates for 1990 for harbor seals and NFS, and make a proportion (from parameter sheet [here]())
+2. Multiply GOA-wide harbor seal numbers by this proportion, to get numbers of NFS for the purpose of this analysis.
+3. Sum up the area of the boxes along the shelf, and divide by the total number of NFS.
+4. Multiply the NFS density obtained at point 3 by the area of the boxes along the shelf, to have box-specific abundances.
+
+Be careful not to push into Shelikof, which may be deeper than 200 but probably out of range.
+```{r}
+#1
+hs_abundance <- 107633
+nfs_abundance <- 877000/77010000*353260 # divide by NEP area and multiply by GOA model area
+prop <- nfs_abundance/hs_abundance # not so many
+
+nfs_this_abundance <- sum(harbor_goa_box$Harbor_total)*prop
+```
+
+Now select the boxes between 200 and 500 m.
+```{r}
+shelf_200_500 <- atlantis_box %>% filter(between(botz,-500,-200), .bx0!=29, .bx0!=34, .bx0!=94, .bx0!=103, .bx0!=104) # remove boxes far into the shelf
+
+area_200_500 <- sum(shelf_200_500$area)
+nfs_density <- nfs_this_abundance/area_200_500
+
+shelf_200_500 <- shelf_200_500 %>%
+  mutate(NFS_abundance = nfs_density*area) %>%
+  st_set_geometry(NULL) %>%
+  select(.bx0,NFS_abundance)
+```
+
+# Pinnipeds
+
+Now bring them together as abundance by box, add a small number to the empty boxes (we do not want real zeroes), and then calculate S1-S4.
+```{r}
+pinniped_goa_box <- harbor_goa_box %>%
+  left_join(shelf_200_500, by = '.bx0') %>%
+  rowwise() %>%
+  mutate(NFS_abundance = ifelse(is.na(NFS_abundance),0,NFS_abundance)) %>%
+  ungroup() %>%
+  mutate(Pinniped_abundance = Harbor_total+NFS_abundance) 
+
+pinmin <- min(pinniped_goa_box$Pinniped_abundance[pinniped_goa_box$Pinniped_abundance>0])
+
+s1s4 <- pinniped_goa_box %>%
+  rowwise() %>%
+  mutate(Pinniped_abundance = ifelse(Pinniped_abundance==0,
+                                     pinmin,
+                                     Pinniped_abundance))%>%
+  mutate(Pinniped_abundance = ifelse(isTRUE(boundary) | botz==0, # finally, reset to 0 the abundance in boundary or island boxes
+                                     0,
+                                     Pinniped_abundance)) %>%
+  ungroup() %>%
+  mutate(S = Pinniped_abundance/sum(Pinniped_abundance)) 
+
+s1s4 %>%
+  st_set_geometry(NULL) %>%
+  select(S) %>% 
+  write.csv('s1s4.csv',row.names = FALSE)
+```
+
+View.
+```{r}
+s1s4 %>%
+  ggplot()+
+  geom_sf(aes(fill=S))+
+  scale_fill_viridis()+
+  theme_bw()
+```
+
+Largely driven by harbor seals SW of Kodiak. For now let's keep juveniles and all seasons the same. 
