@@ -1,4 +1,4 @@
-# Pinnipeds_GOA
+# Spatial distributions of Pinnipeds in Atlantis GOA
 
 This code creates spatial distributions of harbor seals and northern fur seals for Atlantis GOA. These two species are part of the "Pinnipeds" functional group in Atlantis GOA. Harbor seals were captured with colony counts for 2018 from Alaska (AFSC), and for British Columbia with data from [CRIMS - DFO](https://open.canada.ca/data/en/dataset/55a0f2d6-b035-4783-ad5d-1a213fd01ed3).  
 
